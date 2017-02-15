@@ -1,0 +1,114 @@
+{
+# Mismatch information goes to stdout; summary information (and errors, if any) go to stderr
+# Match if: non-empty family name AND
+#           family names match AND
+#           given names match OR 1st 3 letters of given names match OR 1st letter of given names matches 1 letter initial
+#   Matching is NOT case-sensitive.  It IS sensitive to whitespace (leading, trailing or embedded)
+
+#   Next is arbitrary to match doc (and algorithm!) above.  Changed from original guess of 4 because of a
+#   Ken/Kenneth reported mismatch
+$minimum_match_length = 3;
+
+#   lod_url from A Shepherd email 26 Jan 17 
+  $lod_url = "http://lod.bco-dmo.org/sparql?format=text%2Fcsv&timeout=0&query=SELECT+DISTINCT+%3Forcid_url+%3Fperson_uri+%3Fperson_full_name+%3Fperson_family_name+%3Fperson_given_name%0D%0AWHERE+%7B%0D%0A++%3Fperson_uri+rdf%3Atype+foaf%3APerson+.%0D%0A++%7B%3Fperson_uri+skos%3AexactMatch+%3Forcid_url+.%7D+%0D%0A++UNION%0D%0A++%7B%3Fperson_uri+odo%3Amatches+%3Forcid_url+.%7D%0D%0A++UNION+%7B%3Fperson_uri+owl%3AsameAs+%3Forcid_url+.%7D%0D%0A++FILTER+REGEX%28%3Forcid_url%2C+%22orcid.org%22%2C+%22i%22%29%0D%0A%0D%0A++%3Fperson_uri+rdfs%3Alabel+%3Fperson_full_name+.%0D%0A++%3Fperson_uri+foaf%3AfamilyName+%3Fperson_family_name+.%0D%0A++%3Fperson_uri+foaf%3AgivenName+%3Fperson_given_name+.%0D%0A%7D%0D%0AORDER+BY+%3Fperson_uri";
+
+#   Next line on inspection.  Presumably determined by lod_url above.
+  $expected_lod_fields = q|"orcid_url","person_uri","person_full_name","person_family_name","person_given_name"|;
+#   Next line on inspection,  Note that fields may contain commas
+  $lod_field_sep = q|","|;
+  $q_lod_field_sep = quotemeta($lod_field_sep);
+
+#   XML code taken from http://stackoverflow.com/questions/5725374/how-to-parse-a-simple-xml-file-to-a-readable-format
+#   LWP code taken from http://www.xav.com/perl/site/lib/lwpcook.html
+  use XML::Simple;
+  use LWP::UserAgent;
+
+  $lod_ua = LWP::UserAgent->new;
+  $lod_req = HTTP::Request->new(GET => $lod_url);
+  $lod_res = $lod_ua->request($lod_req);
+  ($lod_res->is_success) || (die "*** Error retrieving //lod.bco-dmo.org/sparql URL: " . $lod_res->status_line);
+
+  ($lod_fields,@lod_data) = split "\n", $lod_res->content;
+  ($lod_fields eq $expected_lod_fields) || 
+      die ("*** Mismatch between expected field list and field list from data\n",
+           "*** \t Expected: $expected_lod_fields\n",
+           "*** \t Actual: $lod_fields\n");
+#   Remove initial and trailing "s
+  ($init,$lod_fields,$trail) = ($lod_fields =~ /^(.)(.*)(.)$/);
+  (($init eq '"') && ($trail eq '"')) || (die "*** Did not find expected leading and trailing quotation marks in 1st lod record");
+  @lod_fields = split /$q_lod_field_sep/,$lod_fields;
+  $i = 0;
+  foreach (@lod_fields) {
+    $lod_index{$_} = $i;
+    $i++;
+  }
+  $lod_field_count = $i;
+
+  $orcid_ua = LWP::UserAgent->new;
+  $lod_count = $lod_processed_count = $problem_count = 0;
+  foreach (@lod_data) {
+    $lod_count++;
+
+#     Remove initial and trailing "s
+    ($init,$lod_rec,$trail) = /^(.)(.*)(.)$/;
+    (($init eq '"') && ($trail eq '"')) || 
+          (die "*** Did not find expected leading and trailing quotation marks in lod record ",$lod_count+1);
+    @lod_fields = split /$q_lod_field_sep/,$lod_rec;
+    (@lod_fields == $lod_field_count) || 
+          die ("*** Did not get expected number of fields from lod record ",$lod_count+1,"\n",
+               "*** \tExpected $lod_field_count; got ",scalar(@lod_fields));
+
+    $lod_family_name = $lod_fields[$lod_index{"person_family_name"}];
+    $lod_given_name = $lod_fields[$lod_index{"person_given_name"}];
+    $lod_person_uri = $lod_fields[$lod_index{"person_uri"}];
+
+    $orcid_url = $lod_fields[$lod_index{"orcid_url"}];
+    $orcid_url || (  (print STDERR "*** empty ORCID URL field in lod record ",$lod_count+1,"\n")  &&  next);
+    $lod_processed_count++;
+    $orcid_req = HTTP::Request->new(GET => $orcid_url);
+    $orcid_req->header('Accept' => 'application/xml');
+
+    # send request
+    $orcid_res = $orcid_ua->request($orcid_req);
+
+    if ($orcid_res->is_success) {
+      $orcid_data = XMLin($orcid_res->content);
+  #     "Unwinding" of orcid XML done by inspection
+      $orcid_profile = ${$orcid_data}{"orcid-profile"};
+      $orcid_bio = ${$orcid_profile}{"orcid-bio"};
+      $orcid_personal_details = ${$orcid_bio}{"personal-details"};
+      $orcid_given_names = ${$orcid_personal_details}{"given-names"};
+      $orcid_family_name = ${$orcid_personal_details}{"family-name"};
+      $match_info = match_em();
+      ($match_info eq "MATCH") || ((print STDOUT $match_info,"\n")  &&  $problem_count++);
+    } else {
+       print STDERR "*** Error retrieving ORCID URL $orcid_url: " . $orcid_res->status_line . "\n";
+    }
+  }
+
+  print STDERR " ... $lod_count lod data records read; $lod_processed_count records looked up at ORCID; $problem_count problems\n";
+  exit (0);
+}
+
+sub
+match_em
+{
+  my ($orcid_family,$lod_family,$orcid_given,$lod_given);
+  ($orcid_family_name eq "") && ($lod_family_name eq "") && return "No family name info for BCO-DMO URI $lod_person_uri";
+  ($lod_family_name eq "") && 
+      return "Empty BCO-DMO family name for ORCID family name $orcid_family_name.  BCO-DMO URI $lod_person_uri";
+  ($orcid_family_name eq "") && 
+      return "Empty ORCID family name for BCO-DMO family name $lod_family_name.  BCO-DMO URI $lod_person_uri";
+  $orcid_family = lc($orcid_family_name);
+  $lod_family = lc ($lod_family_name);
+  ($orcid_family eq $lod_family) || 
+    return "ORCID/BCO-DMO family name mismatch: " . $orcid_family_name . "/" . $lod_family_name . ".  BCO-DMO URI $lod_person_uri";
+#   NB: ORCID "given_name" field name is plural; BCO-DMO singular (from data field names)
+  $orcid_given = lc($orcid_given_names);
+  $lod_given = lc($lod_given_name);
+  ($orcid_given eq $lod_given) && return "MATCH";
+  (substr($orcid_given,0,$minimum_match_length) eq substr($lod_given,0,$minimum_match_length)) && return "MATCH";
+  (length($orcid_given) == 1) && ($orcid_given eq substr($lod_given,0,1))  && return "MATCH";
+  (length($lod_given) == 1) && ($lod_given eq substr($orcid_given,0,1))  && return "MATCH";
+  return "ORCID/BCO-DMO given name mismatch: " . $orcid_given_names . "/" . $lod_given_name . ".  BCO-DMO URI $lod_person_uri";
+}
